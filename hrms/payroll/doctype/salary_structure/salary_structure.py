@@ -28,6 +28,7 @@ class SalaryStructure(Document):
 		self.validate_component_based_on_tax_slab()
 		self.validate_payment_days_based_dependent_component()
 		self.validate_timesheet_component()
+		self.validate_variable_components()
 		self.validate_formula_setup()
 
 	def on_update(self):
@@ -110,7 +111,10 @@ class SalaryStructure(Document):
 					)
 					message += "<br><br>" + _(
 						"Disable {0} for the {1} component, to prevent the amount from being deducted twice, as its formula already uses a payment-days-based component."
-					).format(frappe.bold(_("Depends On Payment Days")), frappe.bold(row.salary_component))
+					).format(
+						frappe.bold(_("Depends On Payment Days")),
+						frappe.bold(row.salary_component),
+					)
 					frappe.throw(message, title=_("Payment Days Dependency"))
 
 	def get_component_abbreviations(self):
@@ -119,8 +123,23 @@ class SalaryStructure(Document):
 
 		return abbr
 
+	def validate_variable_components(self):
+		for component_type in ("earnings", "deductions"):
+			for component in self.get(component_type):
+				if component.amount_based_on_employee_variable:
+					if component.amount_based_on_formula:
+						frappe.throw(
+							_("Variable components cannot use formulas. Uncheck 'Amount Based on Formula'.")
+						)
+					if component.amount:
+						frappe.throw(
+							_("Variable components cannot have fixed amounts. Clear the Amount field.")
+						)
+
 	def validate_timesheet_component(self):
-		if not self.salary_slip_based_on_timesheet:
+		if not self.salary_slip_based_on_timesheet or (
+			self.salary_slip_based_on_timesheet and self.use_employee_variables_for_timesheet
+		):
 			return
 
 		for component in self.earnings:
@@ -159,7 +178,9 @@ class SalaryStructure(Document):
 				if earning_component.is_flexible_benefit == 1:
 					have_a_flexi = True
 					max_of_component = frappe.db.get_value(
-						"Salary Component", earning_component.salary_component, "max_benefit_amount"
+						"Salary Component",
+						earning_component.salary_component,
+						"max_benefit_amount",
 					)
 					flexi_amount += max_of_component
 

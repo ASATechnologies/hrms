@@ -34,7 +34,9 @@ from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employe
 from erpnext.utilities.transaction_base import TransactionBase
 
 from hrms.hr.utils import validate_active_employee
-from hrms.payroll.doctype.additional_salary.additional_salary import get_additional_salaries
+from hrms.payroll.doctype.additional_salary.additional_salary import (
+	get_additional_salaries,
+)
 from hrms.payroll.doctype.employee_benefit_application.employee_benefit_application import (
 	get_benefit_component_amount,
 )
@@ -42,7 +44,10 @@ from hrms.payroll.doctype.employee_benefit_claim.employee_benefit_claim import (
 	get_benefit_claim_amount,
 	get_last_payroll_period_benefits,
 )
-from hrms.payroll.doctype.payroll_entry.payroll_entry import get_salary_withholdings, get_start_end_dates
+from hrms.payroll.doctype.payroll_entry.payroll_entry import (
+	get_salary_withholdings,
+	get_start_end_dates,
+)
 from hrms.payroll.doctype.payroll_period.payroll_period import (
 	get_payroll_period,
 	get_period_factor,
@@ -243,7 +248,10 @@ class SalarySlip(TransactionBase):
 		for additional_salary in additional_salary_docs:
 			if additional_salary.name in earnings:
 				frappe.db.set_value(
-					additional_salary.ref_doctype, additional_salary.ref_docname, "status", status
+					additional_salary.ref_doctype,
+					additional_salary.ref_docname,
+					"status",
+					status,
 				)
 
 	def on_cancel(self):
@@ -384,7 +392,10 @@ class SalarySlip(TransactionBase):
 			).run(as_dict=1)
 
 			for data in timesheets:
-				self.append("timesheets", {"time_sheet": data.name, "working_hours": data.total_hours})
+				self.append(
+					"timesheets",
+					{"time_sheet": data.name, "working_hours": data.total_hours},
+				)
 
 	def check_sal_struct(self):
 		ss = frappe.qb.DocType("Salary Structure")
@@ -429,18 +440,185 @@ class SalarySlip(TransactionBase):
 			)
 
 	def pull_sal_struct(self):
-		from hrms.payroll.doctype.salary_structure.salary_structure import make_salary_slip
+		from hrms.payroll.doctype.salary_structure.salary_structure import (
+			make_salary_slip,
+		)
 
 		if self.salary_slip_based_on_timesheet:
 			self.salary_structure = self._salary_structure_doc.name
-			self.hour_rate = self._salary_structure_doc.hour_rate
-			self.base_hour_rate = flt(self.hour_rate) * flt(self.exchange_rate)
-			self.total_working_hours = sum([d.working_hours or 0.0 for d in self.timesheets]) or 0.0
-			wages_amount = self.hour_rate * self.total_working_hours
 
-			self.add_earning_for_hourly_wages(self, self._salary_structure_doc.salary_component, wages_amount)
+			if not self._salary_structure_doc.use_employee_variables_for_timesheet:
+				self.hour_rate = self._salary_structure_doc.hour_rate
+				self.base_hour_rate = flt(self.hour_rate) * flt(self.exchange_rate)
+				self.total_working_hours = sum([d.working_hours or 0.0 for d in self.timesheets]) or 0.0
+				wages_amount = self.hour_rate * self.total_working_hours
+
+				self.add_earning_for_hourly_wages(
+					self, self._salary_structure_doc.salary_component, wages_amount
+				)
 
 		make_salary_slip(self._salary_structure_doc.name, self)
+
+	def calculate_project_based_amount(self, project, hourly_rate):
+		"""
+		Calculate earnings for a specific project from timesheets.
+		Returns: hours_worked × hourly_rate
+		"""
+		if not self.timesheets:
+			return 0.0
+
+		timesheet_names = [d.time_sheet for d in self.timesheets]
+
+		# Get total hours for this specific project
+		result = frappe.db.sql(
+			"""
+            SELECT SUM(td.hours) as total_hours
+            FROM `tabTimesheet Detail` td
+            INNER JOIN `tabTimesheet` t ON td.parent = t.name
+            WHERE t.name IN ({})
+                AND t.employee = %s
+                AND td.project = %s
+        """.format(",".join(["%s"] * len(timesheet_names))),
+			tuple(timesheet_names) + (self.employee, project),
+		)
+
+		hours = flt(result[0][0]) if result and result[0][0] else 0.0
+
+		if hours == 0:
+			# No hours logged for this project - this might be fine
+			# Component will be skipped if remove_if_zero_valued is set
+			return 0.0
+
+		amount = hours * flt(hourly_rate)
+		return amount
+
+	def calculate_aggregated_timesheet_amount(self, configs, salary_component):
+		"""
+		SINGLE COMPONENT MODE: Aggregate all timesheet hours across all
+		project+activity combinations using their respective hourly rates.
+
+		Args:
+		    configs: List of employee variable configs for this component
+		    salary_component: The salary component name
+
+		Returns:
+		    Total aggregated amount
+		"""
+		if not self.timesheets:
+			return 0.0
+
+		# Build rate lookup: {(project, activity): hourly_rate}
+		rate_lookup = {}
+		for config in configs:
+			key = (config.project, config.activity)
+			rate_lookup[key] = flt(config.hourly_rate)
+
+		# Get timesheet details grouped by project and activity
+		timesheet_data = self.get_timesheet_details_by_project_activity()
+
+		# Calculate total amount
+		total_amount = 0.0
+		missing_configs = []
+
+		for (project, activity), hours in timesheet_data.items():
+			rate = rate_lookup.get((project, activity))
+
+			if rate is None:
+				# Track missing configurations
+				missing_configs.append(f"{project} - {activity}")
+				continue
+
+			amount = flt(hours) * flt(rate)
+			total_amount += amount
+
+		# Throw error if any project+activity combinations are missing
+		if missing_configs:
+			frappe.throw(
+				_(
+					"Hourly rates not defined in Employee Salary Variable for employee {0} and component {1}:<br>{2}"
+				).format(
+					frappe.bold(self.employee_name),
+					frappe.bold(salary_component),
+					"<br>".join([f"• {frappe.bold(combo)}" for combo in missing_configs]),
+				),
+				title=_("Missing Rate Configuration"),
+			)
+
+		return total_amount
+
+	def calculate_project_activity_amount(self, project, activity, hourly_rate, salary_component):
+		"""
+		MULTIPLE COMPONENT MODE: Calculate earnings for a specific
+		project+activity combination.
+
+		Args:
+		    project: Project name
+		    activity: Activity type name
+		    hourly_rate: Hourly rate for this combination
+		    salary_component: Component name (for error messages)
+
+		Returns:
+		    Amount for this specific project+activity
+		"""
+		if not self.timesheets:
+			return 0.0
+
+		timesheet_names = [d.time_sheet for d in self.timesheets]
+
+		# Get total hours for this specific project+activity combination
+		result = frappe.db.sql(
+			"""
+            SELECT SUM(td.hours) as total_hours
+            FROM `tabTimesheet Detail` td
+            INNER JOIN `tabTimesheet` t ON td.parent = t.name
+            WHERE t.name IN ({})
+                AND t.employee = %s
+                AND td.project = %s
+                AND td.activity_type = %s
+        """.format(",".join(["%s"] * len(timesheet_names))),
+			tuple(timesheet_names) + (self.employee, project, activity),
+		)
+
+		hours = flt(result[0][0]) if result and result[0][0] else 0.0
+
+		if hours == 0:
+			# No hours logged for this combination
+			# Component will be skipped if remove_if_zero_valued is set
+			return 0.0
+
+		amount = hours * flt(hourly_rate)
+		return amount
+
+	def get_timesheet_details_by_project_activity(self):
+		"""
+		Fetch timesheet details grouped by project AND activity.
+		Returns: dict {(project, activity): total_hours}
+		"""
+		if not self.timesheets:
+			return {}
+
+		timesheet_names = [d.time_sheet for d in self.timesheets]
+
+		# Fetch timesheet details grouped by project and activity
+		details = frappe.db.sql(
+			"""
+            SELECT
+                td.project,
+                td.activity_type as activity,
+                SUM(td.hours) as total_hours
+            FROM `tabTimesheet Detail` td
+            INNER JOIN `tabTimesheet` t ON td.parent = t.name
+            WHERE t.name IN ({})
+                AND t.employee = %s
+                AND td.project IS NOT NULL
+                AND td.activity_type IS NOT NULL
+            GROUP BY td.project, td.activity_type
+        """.format(",".join(["%s"] * len(timesheet_names))),
+			tuple(timesheet_names) + (self.employee,),
+			as_dict=1,
+		)
+
+		return {(detail.project, detail.activity): flt(detail.total_hours) for detail in details}
 
 	def get_working_days_details(self, lwp=None, for_preview=0):
 		payroll_settings = frappe.get_cached_value(
@@ -484,7 +662,9 @@ class SalarySlip(TransactionBase):
 
 		if payroll_settings.payroll_based_on == "Attendance":
 			actual_lwp, absent = self.calculate_lwp_ppl_and_absent_days_based_on_attendance(
-				holidays, daily_wages_fraction_for_half_day, consider_marked_attendance_on_holidays
+				holidays,
+				daily_wages_fraction_for_half_day,
+				consider_marked_attendance_on_holidays,
 			)
 			self.absent_days = absent
 		else:
@@ -517,7 +697,8 @@ class SalarySlip(TransactionBase):
 			if payroll_settings.payroll_based_on == "Attendance":
 				if consider_unmarked_attendance_as == "Absent":
 					unmarked_days = self.get_unmarked_days(
-						payroll_settings.include_holidays_in_total_working_days, holidays
+						payroll_settings.include_holidays_in_total_working_days,
+						holidays,
 					)
 					self.absent_days += unmarked_days  # will be treated as absent
 					self.payment_days -= unmarked_days
@@ -628,7 +809,8 @@ class SalarySlip(TransactionBase):
 			if self.relieving_date < getdate(self.start_date) and employee_status != "Left":
 				frappe.throw(
 					_("Employee {0} relieved on {1} must be set as 'Left'").format(
-						get_link_to_form("Employee", self.employee), formatdate(self.relieving_date)
+						get_link_to_form("Employee", self.employee),
+						formatdate(self.relieving_date),
 					)
 				)
 
@@ -698,7 +880,13 @@ class SalarySlip(TransactionBase):
 			leave_types = frappe.get_all(
 				"Leave Type",
 				or_filters={"is_ppl": 1, "is_lwp": 1},
-				fields=["name", "is_lwp", "is_ppl", "fraction_of_daily_salary_per_leave", "include_holiday"],
+				fields=[
+					"name",
+					"is_lwp",
+					"is_ppl",
+					"fraction_of_daily_salary_per_leave",
+					"include_holiday",
+				],
 			)
 			return {leave_type.name: leave_type for leave_type in leave_types}
 
@@ -726,7 +914,10 @@ class SalarySlip(TransactionBase):
 		return attendance_details
 
 	def calculate_lwp_ppl_and_absent_days_based_on_attendance(
-		self, holidays, daily_wages_fraction_for_half_day, consider_marked_attendance_on_holidays
+		self,
+		holidays,
+		daily_wages_fraction_for_half_day,
+		consider_marked_attendance_on_holidays,
 	):
 		lwp = 0
 		absent = 0
@@ -827,7 +1018,8 @@ class SalarySlip(TransactionBase):
 		def set_gross_pay_and_base_gross_pay():
 			self.gross_pay = self.get_component_totals("earnings", depends_on_payment_days=1)
 			self.base_gross_pay = flt(
-				flt(self.gross_pay) * flt(self.exchange_rate), self.precision("base_gross_pay")
+				flt(self.gross_pay) * flt(self.exchange_rate),
+				self.precision("base_gross_pay"),
 			)
 
 		if self.salary_structure:
@@ -847,6 +1039,13 @@ class SalarySlip(TransactionBase):
 
 		set_gross_pay_and_base_gross_pay()
 
+		# Calculate timesheet totals after earnings are calculated
+		if (
+			self.salary_slip_based_on_timesheet
+			and self._salary_structure_doc.use_employee_variables_for_timesheet
+		):
+			self.calculate_timesheet_totals()
+
 		if self.salary_structure:
 			self.calculate_component_amounts("deductions")
 
@@ -860,7 +1059,8 @@ class SalarySlip(TransactionBase):
 	def set_net_pay(self):
 		self.total_deduction = self.get_component_totals("deductions")
 		self.base_total_deduction = flt(
-			flt(self.total_deduction) * flt(self.exchange_rate), self.precision("base_total_deduction")
+			flt(self.total_deduction) * flt(self.exchange_rate),
+			self.precision("base_total_deduction"),
 		)
 		self.net_pay = flt(self.gross_pay) - (
 			flt(self.total_deduction) + flt(self.get("total_loan_repayment"))
@@ -870,14 +1070,109 @@ class SalarySlip(TransactionBase):
 		self.base_rounded_total = flt(rounded(self.base_net_pay), self.precision("base_net_pay"))
 		if self.hour_rate:
 			self.base_hour_rate = flt(
-				flt(self.hour_rate) * flt(self.exchange_rate), self.precision("base_hour_rate")
+				flt(self.hour_rate) * flt(self.exchange_rate),
+				self.precision("base_hour_rate"),
 			)
 		self.set_net_total_in_words()
+
+	def calculate_timesheet_totals(self):
+		"""
+		Calculate total hours and weighted average hourly rate for timesheet-based salary slips.
+		Works for both standard mode and employee variables mode.
+		"""
+		if not self.salary_slip_based_on_timesheet:
+			return
+
+		if not self._salary_structure_doc.use_employee_variables_for_timesheet:
+			# Standard mode - already handled in pull_sal_struct()
+			return
+
+		# EMPLOYEE VARIABLES MODE
+		# Calculate total hours from all timesheets
+		total_hours = self._calculate_total_timesheet_hours()
+
+		# Calculate total wages from variable components
+		total_wages = self._calculate_total_timesheet_wages()
+
+		# Set totals
+		if total_hours > 0:
+			self.total_working_hours = total_hours
+			self.hour_rate = flt(total_wages / total_hours)  # Weighted average
+			self.base_hour_rate = flt(self.hour_rate) * flt(self.exchange_rate)
+		else:
+			self.total_working_hours = 0
+			self.hour_rate = 0
+			self.base_hour_rate = 0
+
+	def _calculate_total_timesheet_hours(self):
+		"""
+		Get total hours from all timesheets for this salary slip.
+		"""
+		if not self.timesheets:
+			return 0.0
+
+		timesheet_names = [d.time_sheet for d in self.timesheets]
+
+		result = frappe.db.sql(
+			"""
+            SELECT SUM(td.hours) as total_hours
+            FROM `tabTimesheet Detail` td
+            INNER JOIN `tabTimesheet` t ON td.parent = t.name
+            WHERE t.name IN ({})
+                AND t.employee = %s
+        """.format(",".join(["%s"] * len(timesheet_names))),
+			tuple(timesheet_names) + (self.employee,),
+		)
+
+		return flt(result[0][0]) if result and result[0][0] else 0.0
+
+	def _calculate_total_timesheet_wages(self):
+		"""
+		Calculate total wages from all timesheet-related variable components.
+		Only includes components that are project-based employee variables.
+		"""
+		total_wages = 0.0
+
+		for earning in self.earnings:
+			# Skip additional salary components
+			if earning.get("additional_salary"):
+				continue
+
+			# Check if this is a timesheet-related variable component
+			if self._is_timesheet_variable_component(earning.salary_component):
+				total_wages += flt(earning.amount)
+
+		return total_wages
+
+	def _is_timesheet_variable_component(self, salary_component):
+		"""
+		Check if a salary component is configured as a project-based
+		employee variable (timesheet-related).
+		"""
+		# Check if component exists in employee variables with project derivation
+		result = frappe.db.sql(
+			"""
+            SELECT 1
+            FROM `tabEmployee Salary Variables Detail` component
+            INNER JOIN `tabEmployee Salary Variables` parent
+                ON component.parent = parent.name
+            WHERE parent.employee = %s
+                AND parent.salary_structure = %s
+                AND component.salary_component = %s
+                AND component.derived_from = 'Project Timesheet'
+            LIMIT 1
+        """,
+			(self.employee, self.salary_structure, salary_component),
+		)
+
+		return bool(result)
 
 	def compute_taxable_earnings_for_year(self):
 		# get taxable_earnings, opening_taxable_earning, paid_taxes for previous period
 		self.previous_taxable_earnings, exempted_amount = self.get_taxable_earnings_for_prev_period(
-			self.payroll_period.start_date, self.start_date, self.tax_slab.allow_tax_exemption
+			self.payroll_period.start_date,
+			self.start_date,
+			self.tax_slab.allow_tax_exemption,
 		)
 
 		self.previous_taxable_earnings_before_exemption = self.previous_taxable_earnings + exempted_amount
@@ -920,7 +1215,7 @@ class SalarySlip(TransactionBase):
 		# get taxable_earnings for current period (all days)
 		self.current_taxable_earnings = self.get_taxable_earnings(self.tax_slab.allow_tax_exemption)
 		self.future_structured_taxable_earnings = self.current_taxable_earnings.taxable_earnings * (
-			round(self.remaining_sub_periods) - 1
+			ceil(self.remaining_sub_periods) - 1
 		)
 
 		current_taxable_earnings_before_exemption = (
@@ -928,7 +1223,7 @@ class SalarySlip(TransactionBase):
 			+ self.current_taxable_earnings.amount_exempted_from_income_tax
 		)
 		self.future_structured_taxable_earnings_before_exemption = (
-			current_taxable_earnings_before_exemption * (round(self.remaining_sub_periods) - 1)
+			current_taxable_earnings_before_exemption * (ceil(self.remaining_sub_periods) - 1)
 		)
 
 		# get taxable_earnings, addition_earnings for current actual payment days
@@ -1016,7 +1311,10 @@ class SalarySlip(TransactionBase):
 	def compute_non_taxable_earnings(self):
 		# Previous period non taxable earnings
 		prev_period_non_taxable_earnings = self.get_salary_slip_details(
-			self.payroll_period.start_date, self.start_date, parentfield="earnings", is_tax_applicable=0
+			self.payroll_period.start_date,
+			self.start_date,
+			parentfield="earnings",
+			is_tax_applicable=0,
 		)
 
 		(
@@ -1130,7 +1428,13 @@ class SalarySlip(TransactionBase):
 			posting_date = start_date
 
 		local_data = self.data.copy()
-		local_data.update({"start_date": start_date, "end_date": end_date, "posting_date": posting_date})
+		local_data.update(
+			{
+				"start_date": start_date,
+				"end_date": end_date,
+				"posting_date": posting_date,
+			}
+		)
 
 		return flt(self.eval_condition_and_formula(struct_row, local_data))
 
@@ -1166,8 +1470,134 @@ class SalarySlip(TransactionBase):
 	def add_structure_components(self, component_type):
 		self.data, self.default_data = self.get_data_for_eval()
 
+		# PASS 1: Process variable components FIRST
+		# These populate self.data so formulas can reference them
 		for struct_row in self._salary_structure_doc.get(component_type):
-			self.add_structure_component(struct_row, component_type)
+			if struct_row.amount_based_on_employee_variable:
+				self.add_variable_component(struct_row, component_type)
+
+		# PASS 2: Process non-variable components (formula/fixed)
+		# These can now reference variable component values
+		for struct_row in self._salary_structure_doc.get(component_type):
+			if not struct_row.amount_based_on_employee_variable:
+				self.add_structure_component(struct_row, component_type)
+
+	def add_variable_component(self, struct_row, component_type):
+		"""
+		Add component with employee-specific variable amount.
+		Fetches amount from Employee Salary Variable, bypasses formula evaluation.
+		"""
+		# Fetch employee-specific amount
+		amount = self.get_employee_variable_amount(struct_row.salary_component)
+
+		if amount is None:
+			frappe.throw(
+				_("No variable amount defined for {0} for employee {1}").format(
+					struct_row.salary_component, self.employee_name
+				)
+			)
+
+		self.default_data[struct_row.abbr] = flt(amount)
+		self.data[struct_row.abbr] = flt(amount)
+
+		# Non-statistical component - add row to salary slip
+		if not struct_row.statistical_component:
+			# Add row to salary slip (same logic as regular components)
+			remove_if_zero_valued = frappe.get_cached_value(
+				"Salary Component", struct_row.salary_component, "remove_if_zero_valued"
+			)
+
+			if amount or not remove_if_zero_valued:
+				self.update_component_row(
+					struct_row,
+					amount,
+					component_type,
+					data=self.data,
+					default_amount=amount,
+					remove_if_zero_valued=remove_if_zero_valued,
+				)
+
+	def get_employee_variable_amount(self, salary_component):
+		"""
+		Fetch employee-specific amount for a variable component.
+		- For fixed_amount: returns the amount directly
+		- For project: calculates based on timesheet (project, activity) combinations
+
+		Two modes:
+		1. Single component: Aggregates ALL project+activity earnings
+		2. Multiple components: One specific project/activity per component
+		"""
+		# Cache the lookup
+		if not hasattr(self, "_employee_variable_cache"):
+			self._employee_variable_cache = {}
+
+		if salary_component in self._employee_variable_cache:
+			return self._employee_variable_cache[salary_component]
+
+		# Check if this component has any employee variable configs
+		configs = frappe.db.sql(
+			"""
+            SELECT
+                component.derived_from,
+                component.amount,
+                component.project,
+                component.activity,
+                component.hourly_rate
+            FROM `tabEmployee Salary Variables Detail` component
+            INNER JOIN `tabEmployee Salary Variables` parent
+                ON component.parent = parent.name
+            WHERE parent.employee = %s
+                AND parent.salary_structure = %s
+                AND component.salary_component = %s
+        """,
+			(self.employee, self.salary_structure, salary_component),
+			as_dict=1,
+		)
+		print(configs)
+		if not configs:
+			self._employee_variable_cache[salary_component] = None
+			return None
+
+		# Determine calculation mode
+		derived_from = configs[0].derived_from
+
+		if derived_from == "Fixed Amount":
+			# Simple case: fixed amount
+			amount = flt(configs[0].amount)
+
+		elif derived_from == "Project Timesheet":
+			if not self._salary_structure_doc.use_employee_variables_for_timesheet:
+				frappe.throw(
+					_(
+						"Salary component {0} is configured for project-based calculation but 'Use Employee Variables for Timesheet' is not enabled"
+					).format(frappe.bold(salary_component))
+				)
+
+			# Check if using single component mode
+			if self._salary_structure_doc.use_single_salary_component_for_timesheet == 1:
+				# SINGLE COMPONENT MODE: Aggregate all project+activity combinations
+				amount = self.calculate_aggregated_timesheet_amount(configs, salary_component)
+			else:
+				# MULTIPLE COMPONENT MODE: Match specific project+activity
+				# In this mode, there should only be ONE config for this component
+				if len(configs) > 1:
+					frappe.throw(
+						_(
+							"Multiple project configurations found for {0}. When not using single component mode, each salary component should map to only one project+activity combination."
+						).format(frappe.bold(salary_component))
+					)
+
+				amount = self.calculate_project_activity_amount(
+					configs[0].project,
+					configs[0].activity,
+					configs[0].hourly_rate,
+					salary_component,
+				)
+		else:
+			amount = None
+
+		self._employee_variable_cache[salary_component] = amount
+		return amount
 
 	def add_structure_component(self, struct_row, component_type):
 		if (
@@ -1226,6 +1656,9 @@ class SalarySlip(TransactionBase):
 		data.update(self.as_dict())
 		data.update(employee)
 
+		# ← ADD THIS: Load employee variable amounts FIRST
+		data.update(self.get_employee_variable_amounts())
+
 		data.update(self.get_component_abbr_map())
 
 		# shallow copy of data to store default amounts (without payment days) for tax calculation
@@ -1243,6 +1676,37 @@ class SalarySlip(TransactionBase):
 
 		return data, default_data
 
+	def get_employee_variable_amounts(self):
+		"""
+		Fetch employee-specific variable component amounts.
+		Returns dict with component abbreviations as keys.
+		"""
+		if not hasattr(self, "_employee_variable_cache"):
+			self._employee_variable_cache = {}
+
+			# Fetch the Employee Salary Variable doc for this employee
+			employee_vars = frappe.db.get_value(
+				"Employee Salary Variables",
+				{
+					"employee": self.employee,
+				},
+				"name",
+			)
+
+			if employee_vars:
+				# Fetch child table entries
+				component_vars = frappe.get_all(
+					"Employee Salary Variables Detail",  # child table name
+					filters={"parent": employee_vars, "derived_from": "Fixed Amount"},
+					fields=["salary_component", "amount"],
+				)
+
+				# Build dict with abbreviations
+				for var in component_vars:
+					self._employee_variable_cache[var.salary_component] = flt(var.amount)
+
+		return self._employee_variable_cache
+
 	def get_component_abbr_map(self):
 		def _fetch_component_values():
 			return {
@@ -1254,12 +1718,17 @@ class SalarySlip(TransactionBase):
 
 	def eval_condition_and_formula(self, struct_row, data):
 		try:
-			condition, formula, amount = struct_row.condition, struct_row.formula, struct_row.amount
+			condition, formula, amount = (
+				struct_row.condition,
+				struct_row.formula,
+				struct_row.amount,
+			)
 			if condition and not _safe_eval(condition, self.whitelisted_globals, data):
 				return None
 			if struct_row.amount_based_on_formula and formula:
 				amount = flt(
-					_safe_eval(formula, self.whitelisted_globals, data), struct_row.precision("amount")
+					_safe_eval(formula, self.whitelisted_globals, data),
+					struct_row.precision("amount"),
 				)
 			if amount:
 				data[struct_row.abbr] = amount
@@ -1314,7 +1783,10 @@ class SalarySlip(TransactionBase):
 						self.update_component_row(struct_row, benefit_component_amount, "earnings")
 				else:
 					benefit_claim_amount = get_benefit_claim_amount(
-						self.employee, self.start_date, self.end_date, struct_row.salary_component
+						self.employee,
+						self.start_date,
+						self.end_date,
+						struct_row.salary_component,
 					)
 					if benefit_claim_amount:
 						self.update_component_row(struct_row, benefit_claim_amount, "earnings")
@@ -1325,7 +1797,11 @@ class SalarySlip(TransactionBase):
 		if payroll_period:
 			if getdate(payroll_period.end_date) <= getdate(self.end_date):
 				last_benefits = get_last_payroll_period_benefits(
-					self.employee, self.start_date, self.end_date, payroll_period, self._salary_structure_doc
+					self.employee,
+					self.start_date,
+					self.end_date,
+					payroll_period,
+					self._salary_structure_doc,
 				)
 				if last_benefits:
 					for last_benefit in last_benefits:
@@ -1413,10 +1889,10 @@ class SalarySlip(TransactionBase):
 	def _fetch_tax_components_by_company(self) -> dict:
 		"""
 		Returns:
-		    dict: A dictionary containing tax components grouped by company.
+		        dict: A dictionary containing tax components grouped by company.
 
 		Raises:
-		    None
+		        None
 		"""
 
 		tax_components = {}
@@ -1515,6 +1991,7 @@ class SalarySlip(TransactionBase):
 				"do_not_include_in_accounts",
 				"is_tax_applicable",
 				"is_flexible_benefit",
+				"amount_based_on_employee_variable",
 				"variable_based_on_taxable_salary",
 				"exempted_from_income_tax",
 			):
@@ -1599,7 +2076,10 @@ class SalarySlip(TransactionBase):
 		self.full_tax_on_additional_earnings = 0.0
 		if self.current_additional_earnings_with_full_tax:
 			self.total_tax_amount, __ = calculate_tax_by_tax_slab(
-				self.total_taxable_earnings, self.tax_slab, self.whitelisted_globals, eval_locals
+				self.total_taxable_earnings,
+				self.tax_slab,
+				self.whitelisted_globals,
+				eval_locals,
 			)
 			self.full_tax_on_additional_earnings = self.total_tax_amount - self.total_structured_tax_amount
 
@@ -1628,7 +2108,10 @@ class SalarySlip(TransactionBase):
 		if not income_tax_slab:
 			frappe.throw(
 				_("Income Tax Slab not set in Salary Structure Assignment: {0}").format(
-					get_link_to_form("Salary Structure Assignment", self._salary_structure_assignment.name)
+					get_link_to_form(
+						"Salary Structure Assignment",
+						self._salary_structure_assignment.name,
+					)
 				),
 				title=_("Missing Tax Slab"),
 			)
@@ -1654,7 +2137,10 @@ class SalarySlip(TransactionBase):
 
 		if allow_tax_exemption:
 			exempted_amount = self.get_salary_slip_details(
-				start_date, end_date, parentfield="deductions", exempted_from_income_tax=1
+				start_date,
+				end_date,
+				parentfield="deductions",
+				exempted_from_income_tax=1,
 			)
 
 		opening_taxable_earning = self.get_opening_for("taxable_earnings_till_date", start_date, end_date)
@@ -1741,9 +2227,15 @@ class SalarySlip(TransactionBase):
 				amount, additional_amount = self.get_amount_based_on_payment_days(earning)
 			else:
 				if earning.additional_amount:
-					amount, additional_amount = earning.amount or 0, earning.additional_amount or 0
+					amount, additional_amount = (
+						earning.amount or 0,
+						earning.additional_amount or 0,
+					)
 				else:
-					amount, additional_amount = earning.default_amount or 0, earning.additional_amount or 0
+					amount, additional_amount = (
+						earning.default_amount or 0,
+						earning.additional_amount or 0,
+					)
 
 			if earning.is_tax_applicable:
 				if earning.is_flexible_benefit:
@@ -1867,7 +2359,10 @@ class SalarySlip(TransactionBase):
 
 		# apply rounding
 		if frappe.db.get_value(
-			"Salary Component", row.salary_component, "round_to_the_nearest_integer", cache=True
+			"Salary Component",
+			row.salary_component,
+			"round_to_the_nearest_integer",
+			cache=True,
 		):
 			amount, additional_amount = rounded(amount or 0), rounded(additional_amount or 0)
 
@@ -1907,7 +2402,11 @@ class SalarySlip(TransactionBase):
 			if self.deduct_tax_for_unsubmitted_tax_exemption_proof:
 				exemption_proof = frappe.db.get_value(
 					"Employee Tax Exemption Proof Submission",
-					{"employee": self.employee, "payroll_period": self.payroll_period.name, "docstatus": 1},
+					{
+						"employee": self.employee,
+						"payroll_period": self.payroll_period.name,
+						"docstatus": 1,
+					},
 					"exemption_amount",
 					cache=True,
 				)
@@ -1916,7 +2415,11 @@ class SalarySlip(TransactionBase):
 			else:
 				declaration = frappe.db.get_value(
 					"Employee Tax Exemption Declaration",
-					{"employee": self.employee, "payroll_period": self.payroll_period.name, "docstatus": 1},
+					{
+						"employee": self.employee,
+						"payroll_period": self.payroll_period.name,
+						"docstatus": 1,
+					},
 					"total_exemption_amount",
 					cache=True,
 				)
@@ -1989,7 +2492,13 @@ class SalarySlip(TransactionBase):
 				"send_after": posting_date if posting_date > getdate() else None,
 			}
 			if not frappe.flags.in_test:
-				enqueue(method=frappe.sendmail, queue="short", timeout=300, is_async=True, **email_args)
+				enqueue(
+					method=frappe.sendmail,
+					queue="short",
+					timeout=300,
+					is_async=True,
+					**email_args,
+				)
 			else:
 				frappe.sendmail(**email_args)
 		else:
@@ -2020,7 +2529,10 @@ class SalarySlip(TransactionBase):
 
 	def pull_emp_details(self):
 		account_details = frappe.get_cached_value(
-			"Employee", self.employee, ["bank_name", "bank_ac_no", "salary_mode"], as_dict=1
+			"Employee",
+			self.employee,
+			["bank_name", "bank_ac_no", "salary_mode"],
+			as_dict=1,
 		)
 		if account_details:
 			self.mode_of_payment = account_details.salary_mode
@@ -2069,7 +2581,10 @@ class SalarySlip(TransactionBase):
 		wages_amount = self.total_working_hours * self.hour_rate
 		self.base_hour_rate = flt(self.hour_rate) * flt(self.exchange_rate)
 		salary_component = frappe.db.get_value(
-			"Salary Structure", {"name": self.salary_structure}, "salary_component", cache=True
+			"Salary Structure",
+			{"name": self.salary_structure},
+			"salary_component",
+			cache=True,
 		)
 		if self.earnings:
 			for i, earning in enumerate(self.earnings):
@@ -2166,7 +2681,9 @@ class SalarySlip(TransactionBase):
 		self.set("leave_details", [])
 
 		if frappe.db.get_single_value("Payroll Settings", "show_leave_balances_in_salary_slip"):
-			from hrms.hr.doctype.leave_application.leave_application import get_leave_details
+			from hrms.hr.doctype.leave_application.leave_application import (
+				get_leave_details,
+			)
 
 			leave_details = get_leave_details(self.employee, self.end_date, True)
 
@@ -2187,7 +2704,9 @@ class SalarySlip(TransactionBase):
 def unlink_ref_doc_from_salary_slip(doc, method=None):
 	"""Unlinks accrual Journal Entry from Salary Slips on cancellation"""
 	linked_ss = frappe.get_all(
-		"Salary Slip", filters={"journal_entry": doc.name, "docstatus": ["<", 2]}, pluck="name"
+		"Salary Slip",
+		filters={"journal_entry": doc.name, "docstatus": ["<", 2]},
+		pluck="name",
 	)
 
 	if linked_ss:

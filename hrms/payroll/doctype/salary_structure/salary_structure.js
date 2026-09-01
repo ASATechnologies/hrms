@@ -25,7 +25,7 @@ frappe.ui.form.on("Salary Structure", {
 			d.show();
 		});
 		let help_button_wrapper = frm.get_field(
-			"conditions_and_formula_variable_and_example",
+			"conditions_and_formula_variable_and_example"
 		).$wrapper;
 		help_button_wrapper.empty();
 		help_button_wrapper.append(frm.doc.filters_html).append(help_button);
@@ -51,7 +51,7 @@ frappe.ui.form.on("Salary Structure", {
 			frm.doc.mode_of_payment,
 			function (account) {
 				frm.set_value("payment_account", account);
-			},
+			}
 		);
 	},
 
@@ -91,19 +91,19 @@ frappe.ui.form.on("Salary Structure", {
 				"total_earning",
 				"total_deduction",
 			],
-			frm.doc.currency,
+			frm.doc.currency
 		);
 
 		frm.set_currency_labels(
 			["amount", "additional_amount", "tax_on_flexible_benefit", "tax_on_additional_salary"],
 			frm.doc.currency,
-			"earnings",
+			"earnings"
 		);
 
 		frm.set_currency_labels(
 			["amount", "additional_amount", "tax_on_flexible_benefit", "tax_on_additional_salary"],
 			frm.doc.currency,
-			"deductions",
+			"deductions"
 		);
 
 		frm.refresh_fields();
@@ -124,7 +124,7 @@ frappe.ui.form.on("Salary Structure", {
 					doc.company = frm.doc.company;
 					frappe.set_route("Form", "Salary Structure Assignment", doc.name);
 				},
-				__("Create"),
+				__("Create")
 			);
 
 			frm.add_custom_button(
@@ -135,7 +135,7 @@ frappe.ui.form.on("Salary Structure", {
 					doc.company = frm.doc.company;
 					frappe.set_route("Form", "Bulk Salary Structure Assignment", doc.name);
 				},
-				__("Create"),
+				__("Create")
 			);
 
 			frm.add_custom_button(
@@ -146,7 +146,7 @@ frappe.ui.form.on("Salary Structure", {
 						frappe.set_route("Form", "Income Tax Slab", doc.name);
 					});
 				},
-				__("Create"),
+				__("Create")
 			);
 
 			frm.page.set_inner_btn_group_as_primary(__("Create"));
@@ -156,7 +156,7 @@ frappe.ui.form.on("Salary Structure", {
 				function () {
 					frm.trigger("preview_salary_slip");
 				},
-				__("Actions"),
+				__("Actions")
 			);
 		}
 
@@ -174,6 +174,14 @@ frappe.ui.form.on("Salary Structure", {
 	},
 
 	salary_slip_based_on_timesheet: function (frm) {
+		frm.trigger("toggle_fields");
+	},
+
+	use_employee_variables_for_timesheet: function (frm) {
+		frm.trigger("toggle_fields");
+	},
+
+	use_single_salary_component_for_timesheet: function (frm) {
 		frm.trigger("toggle_fields");
 	},
 
@@ -239,10 +247,28 @@ frappe.ui.form.on("Salary Structure", {
 
 	toggle_fields: function (frm) {
 		frm.toggle_display(
-			["salary_component", "hour_rate"],
-			frm.doc.salary_slip_based_on_timesheet,
+			["hour_rate"],
+			frm.doc.salary_slip_based_on_timesheet &&
+				frm.doc.use_employee_variables_for_timesheet == 0
 		);
-		frm.toggle_reqd(["salary_component", "hour_rate"], frm.doc.salary_slip_based_on_timesheet);
+
+		frm.toggle_display(
+			["salary_component"],
+			frm.doc.salary_slip_based_on_timesheet &&
+				frm.doc.use_single_salary_component_for_timesheet == 1
+		);
+
+		frm.toggle_reqd(
+			["hour_rate"],
+			frm.doc.salary_slip_based_on_timesheet && !frm.doc.use_employee_variables_for_timesheet
+		);
+
+		frm.toggle_reqd(
+			["salary_component"],
+			frm.doc.salary_slip_based_on_timesheet &&
+				frm.doc.use_single_salary_component_for_timesheet
+		);
+
 		frm.toggle_reqd(["payroll_frequency"], !frm.doc.salary_slip_based_on_timesheet);
 	},
 });
@@ -316,7 +342,7 @@ frappe.ui.form.on("Salary Detail", {
 			frappe.msgprint({
 				message: __(
 					"{0} Row #{1}: {2} needs to be enabled for the formula to be considered.",
-					[toTitle(row.parentfield), row.idx, __("Amount based on formula").bold()],
+					[toTitle(row.parentfield), row.idx, __("Amount based on formula").bold()]
 				),
 				title: __("Warning"),
 				indicator: "orange",

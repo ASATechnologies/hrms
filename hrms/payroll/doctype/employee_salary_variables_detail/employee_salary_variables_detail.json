@@ -1,0 +1,82 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-02-15 16:25:16.605018",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "salary_component",
+  "derived_from",
+  "amount",
+  "column_break_jwyf",
+  "project",
+  "activity",
+  "hourly_rate"
+ ],
+ "fields": [
+  {
+   "fieldname": "salary_component",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Salary Component",
+   "options": "Salary Component",
+   "reqd": 1
+  },
+  {
+   "fieldname": "derived_from",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Derived From",
+   "options": "\nFixed Amount\nProject Timesheet",
+   "reqd": 1
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Amount",
+   "mandatory_depends_on": "eval:doc.derived_from=='Fixed Amount'"
+  },
+  {
+   "fieldname": "column_break_jwyf",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "hourly_rate",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Hourly Rate",
+   "mandatory_depends_on": "eval:doc.derived_from=='Project Timesheet'"
+  },
+  {
+   "fieldname": "project",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Project",
+   "mandatory_depends_on": "eval:doc.derived_from=='Project Timesheet'",
+   "options": "Project"
+  },
+  {
+   "fieldname": "activity",
+   "fieldtype": "Link",
+   "label": "Activity",
+   "mandatory_depends_on": "eval:doc.derived_from=='Project Timesheet'",
+   "options": "Activity Type"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2026-02-19 11:16:30.444252",
+ "modified_by": "Administrator",
+ "module": "Payroll",
+ "name": "Employee Salary Variables Detail",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}
